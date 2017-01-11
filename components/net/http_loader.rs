@@ -34,8 +34,6 @@ use net_traits::hosts::replace_hosts;
 use net_traits::request::{CacheMode, CredentialsMode, Destination, Origin};
 use net_traits::request::{RedirectMode, Referrer, Request, RequestMode, ResponseTainting};
 use net_traits::response::{HttpsState, Response, ResponseBody, ResponseType};
-use openssl;
-use openssl::ssl::error::{OpensslError, SslError};
 use resource_thread::AuthCache;
 use servo_url::{ImmutableOrigin, ServoUrl};
 use std::collections::HashSet;
@@ -133,26 +131,7 @@ impl NetworkHttpRequestFactory {
                                                       &*self.connector);
 
         if let Err(HttpError::Ssl(ref error)) = connection {
-            let error: &(Error + Send + 'static) = &**error;
-            if let Some(&SslError::OpenSslErrors(ref errors)) = error.downcast_ref::<SslError>() {
-                if errors.iter().any(is_cert_verify_error) {
-                    let mut error_report = vec![format!("ssl error ({}):", openssl::version::version())];
-                    let mut suggestion = None;
-                    for err in errors {
-                        if is_unknown_message_digest_err(err) {
-                            suggestion = Some("<b>Servo recommends upgrading to a newer OpenSSL version.</b>");
-                        }
-                        error_report.push(format_ssl_error(err));
-                    }
-
-                    if let Some(suggestion) = suggestion {
-                        error_report.push(suggestion.to_owned());
-                    }
-
-                    let error_report = error_report.join("<br>\n");
-                    return Err(NetworkError::SslValidation(url, error_report));
-                }
-            }
+            return Err(NetworkError::SslValidation(url, error.description().into()));
         }
 
         let mut request = match connection {
@@ -278,8 +257,8 @@ fn set_cookie_for_url(cookie_jar: &Arc<RwLock<CookieStorage>>,
     let header = Header::parse_header(&[cookie_val.into_bytes()]);
 
     if let Ok(SetCookie(cookies)) = header {
-        for bare_cookie in cookies {
-            if let Some(cookie) = cookie::Cookie::new_wrapped(bare_cookie, request, source) {
+        for cookie in cookies {
+            if let Some(cookie) = cookie::Cookie::from_cookie_string(cookie, request, source) {
                 cookie_jar.push(cookie, request, source);
             }
         }
@@ -494,35 +473,6 @@ fn obtain_response(request_factory: &NetworkHttpRequestFactory,
         };
 
         return Ok((WrappedHttpResponse { response: response }, msg));
-    }
-}
-
-// FIXME: This incredibly hacky. Make it more robust, and at least test it.
-fn is_cert_verify_error(error: &OpensslError) -> bool {
-    match error {
-        &OpensslError::UnknownError { ref library, ref function, ref reason } => {
-            library == "SSL routines" &&
-            function.to_uppercase() == "SSL3_GET_SERVER_CERTIFICATE" &&
-            reason == "certificate verify failed"
-        }
-    }
-}
-
-fn is_unknown_message_digest_err(error: &OpensslError) -> bool {
-    match error {
-        &OpensslError::UnknownError { ref library, ref function, ref reason } => {
-            library == "asn1 encoding routines" &&
-            function == "ASN1_item_verify" &&
-            reason == "unknown message digest algorithm"
-        }
-    }
-}
-
-fn format_ssl_error(error: &OpensslError) -> String {
-    match error {
-        &OpensslError::UnknownError { ref library, ref function, ref reason } => {
-            format!("{}: {} - {}", library, function, reason)
-        }
     }
 }
 
