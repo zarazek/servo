@@ -21,13 +21,24 @@ pub struct SharedRwLock<T> {
 /// Proof that the lock is held for reading
 pub struct ReadGuard<'a, T: 'a> {
     locked_data: &'a SharedRwLock<T>,
-    inner_guard: MaybeRef<'a, RwLockReadGuard<'a, ()>>,
+    inner_guard: ReadGuardInner<'a>,
 }
 
 /// Proof that the lock is held for writing
 pub struct WriteGuard<'a, T: 'a> {
     locked_data: &'a SharedRwLock<T>,
-    inner_guard: MaybeRefMut<'a, RwLockWriteGuard<'a, ()>>,
+    inner_guard: WriteGuardInner<'a>,
+}
+
+enum ReadGuardInner<'a> {
+    Owned(RwLockReadGuard<'a, ()>),
+    Ref(&'a RwLockReadGuard<'a, ()>),
+    Downgraded(&'a RwLockWriteGuard<'a, ()>)
+}
+
+enum WriteGuardInner<'a> {
+    Owned(RwLockWriteGuard<'a, ()>),
+    RefMut(&'a mut RwLockWriteGuard<'a, ()>),
 }
 
 impl<T> SharedRwLock<T> {
@@ -54,7 +65,7 @@ impl<T> SharedRwLock<T> {
     pub fn read(&self) -> ReadGuard<T> {
         ReadGuard {
             locked_data: self,
-            inner_guard: MaybeRef::Owned(self.rwlock.read()),
+            inner_guard: ReadGuardInner::Owned(self.rwlock.read()),
         }
     }
 
@@ -62,7 +73,7 @@ impl<T> SharedRwLock<T> {
     pub fn write(&self) -> WriteGuard<T> {
         WriteGuard {
             locked_data: self,
-            inner_guard: MaybeRefMut::Owned(self.rwlock.write()),
+            inner_guard: WriteGuardInner::Owned(self.rwlock.write()),
         }
     }
 
@@ -75,7 +86,11 @@ impl<T> SharedRwLock<T> {
                 "Calling SharedRwLock::read_with with a guard from an unrelated RwLock");
         ReadGuard {
             locked_data: self,
-            inner_guard: MaybeRef::Ref(&existing_guard.inner_guard),
+            inner_guard: match existing_guard.inner_guard {
+                ReadGuardInner::Owned(ref g) => ReadGuardInner::Ref(g),
+                ReadGuardInner::Ref(g) => ReadGuardInner::Ref(g),
+                ReadGuardInner::Downgraded(ref g) => ReadGuardInner::Downgraded(&*g),
+            },
         }
     }
 
@@ -89,7 +104,10 @@ impl<T> SharedRwLock<T> {
                 "Calling SharedRwLock::write_with with a guard from an unrelated RwLock");
         WriteGuard {
             locked_data: self,
-            inner_guard: MaybeRefMut::RefMut(&mut existing_guard.inner_guard),
+            inner_guard: match existing_guard.inner_guard {
+                WriteGuardInner::Owned(ref mut g) => WriteGuardInner::RefMut(g),
+                WriteGuardInner::RefMut(ref mut g) => WriteGuardInner::RefMut(&mut **g),
+            },
         }
     }
 }
@@ -98,13 +116,30 @@ fn same_rwlock(a: *const RwLock<()>, b: *const RwLock<()>) -> bool {
     a == b
 }
 
+impl<'a, T> WriteGuard<'a, T> {
+    /// Return a read guard that references a write guard
+    pub fn downgrade(&self) -> ReadGuard<T> {
+        ReadGuard {
+            locked_data: self.locked_data,
+            inner_guard: ReadGuardInner::Downgraded(match self.inner_guard {
+                WriteGuardInner::Owned(ref g) => g,
+                WriteGuardInner::RefMut(ref g) => &**g,
+            }),
+        }
+    }
+}
+
 impl<'a, T> Deref for ReadGuard<'a, T> {
     type Target = T;
 
     #[inline]
     fn deref(&self) -> &T {
         // Exercise the borrow checker to ensure we do have a valid guard.
-        let _: &() = &**self.inner_guard;
+        let _: &() = match self.inner_guard {
+            ReadGuardInner::Owned(ref g) => &**g,
+            ReadGuardInner::Ref(g) => &**g,
+            ReadGuardInner::Downgraded(g) => &**g,
+        };
         unsafe {
             &*self.locked_data.data.get()
         }
@@ -117,7 +152,10 @@ impl<'a, T> Deref for WriteGuard<'a, T> {
     #[inline]
     fn deref(&self) -> &T {
         // Exercise the borrow checker to ensure we do have a valid guard.
-        let _: &() = &**self.inner_guard;
+        let _: &() = match self.inner_guard {
+            WriteGuardInner::Owned(ref g) => &**g,
+            WriteGuardInner::RefMut(ref g) => &***g,
+        };
         unsafe {
             &*self.locked_data.data.get()
         }
@@ -128,54 +166,12 @@ impl<'a, T> DerefMut for WriteGuard<'a, T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut T {
         // Exercise the borrow checker to ensure we do have a valid write guard.
-        let _: &mut () = &mut **self.inner_guard;
+        let _: &mut () = match self.inner_guard {
+            WriteGuardInner::Owned(ref mut g) => &mut **g,
+            WriteGuardInner::RefMut(ref mut g) => &mut ***g,
+        };
         unsafe {
             &mut *self.locked_data.data.get()
-        }
-    }
-}
-
-enum MaybeRef<'a, T: 'a> {
-    Owned(T),
-    Ref(&'a T),
-}
-
-enum MaybeRefMut<'a, T: 'a> {
-    Owned(T),
-    RefMut(&'a mut T),
-}
-
-
-impl<'a, T> Deref for MaybeRef<'a, T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        match *self {
-            MaybeRef::Owned(ref x) => x,
-            MaybeRef::Ref(ref x) => x,
-        }
-    }
-}
-
-impl<'a, T> Deref for MaybeRefMut<'a, T> {
-    type Target = T;
-
-    #[inline]
-    fn deref(&self) -> &T {
-        match *self {
-            MaybeRefMut::Owned(ref x) => x,
-            MaybeRefMut::RefMut(ref x) => x,
-        }
-    }
-}
-
-impl<'a, T> DerefMut for MaybeRefMut<'a, T> {
-    #[inline]
-    fn deref_mut(&mut self) -> &mut T {
-        match *self {
-            MaybeRefMut::Owned(ref mut x) => x,
-            MaybeRefMut::RefMut(ref mut x) => x,
         }
     }
 }
