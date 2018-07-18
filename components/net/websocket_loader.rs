@@ -12,9 +12,10 @@ use hyper::header::{CacheControl, CacheDirective, Connection, ConnectionOption};
 use hyper::header::{Headers, Host, SetCookie, Pragma, Protocol, ProtocolName, Upgrade};
 use hyper::http::h1::{LINE_ENDING, parse_response};
 use hyper::method::Method;
-use hyper::net::HttpStream;
+use hyper::net::{HttpStream, HttpsStream, SslClient};
 use hyper::status::StatusCode;
 use hyper::version::HttpVersion;
+use hyper_openssl::OpensslClient;
 use ipc_channel::ipc::{IpcReceiver, IpcSender};
 use net_traits::{CookieSource, MessageData, NetworkError};
 use net_traits::{WebSocketDomAction, WebSocketNetworkEvent};
@@ -118,10 +119,10 @@ pub fn init(
     }).expect("Thread spawning failed");
 }
 
-type Stream = HttpStream;
+type Stream = HttpsStream<<OpensslClient as SslClient>::Stream>;
 
 // https://fetch.spec.whatwg.org/#concept-websocket-connection-obtain
-fn obtain_a_websocket_connection(url: &ServoUrl) -> Result<Stream, NetworkError> {
+fn obtain_a_websocket_connection(url: &ServoUrl, ssl: &OpensslClient) -> Result<Stream, NetworkError> {
     // Step 1.
     let host = url.host_str().unwrap();
 
@@ -137,23 +138,27 @@ fn obtain_a_websocket_connection(url: &ServoUrl) -> Result<Stream, NetworkError>
         _ => panic!("URL's scheme should be ws or wss"),
     };
 
-    if secure {
-        return Err(NetworkError::Internal("WSS is disabled for now.".into()));
-    }
-
     // Steps 4-5.
-    let host = replace_host(host);
-    let tcp_stream = TcpStream::connect((&*host, port)).map_err(|e| {
+    let addr = &(&*replace_host(host), port);
+    let tcp_stream = TcpStream::connect(addr).map_err(|e| {
         NetworkError::Internal(format!("Could not connect to host: {}", e))
     })?;
-    Ok(HttpStream(tcp_stream))
+    let http_stream = HttpStream(tcp_stream);
+
+    if secure {
+        ssl.wrap_client(http_stream, host).map(HttpsStream::Https).map_err(|e| {
+            NetworkError::Internal(format!("Could not establish SSL connection: {}", e))
+        })
+    } else {
+        Ok(HttpsStream::Http(http_stream))
+    }
 }
 
 // https://fetch.spec.whatwg.org/#concept-websocket-establish
 fn establish_a_websocket_connection(
     req_init: RequestInit,
     http_state: &HttpState
-) -> Result<(Option<String>, WsWriter<HttpStream>, WsReader<HttpStream>), NetworkError>
+) -> Result<(Option<String>, WsWriter<Stream>, WsReader<Stream>), NetworkError>
 {
     let protocols = match req_init.mode {
         RequestMode::WebSocket { protocols } => protocols.clone(),
@@ -577,7 +582,7 @@ fn http_network_fetch(url: &ServoUrl,
 
     // Steps 2-3.
     // Request's mode is "websocket".
-    let connection = obtain_a_websocket_connection(url)?;
+    let connection = obtain_a_websocket_connection(url, &http_state.ssl_client)?;
 
     // Step 4.
     // Not applicable: request’s body is null.
